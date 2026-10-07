@@ -1,0 +1,16 @@
+{
+  "name": "ai-study-assistant-root",
+  "version": "1.0.0",
+  "description": "Full-stack AI Study Assistant with Gemini RAG, MongoDB Vector Search, and React",
+  "private": true,
+  "scripts": {
+    "server": "cd server && npm run dev",
+    "client": "cd client && npm run dev",
+    "start": "node server/server.js",
+    "build": "cd client && npm run build",
+    "install:all": "npm --prefix server install && npm --prefix client install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
