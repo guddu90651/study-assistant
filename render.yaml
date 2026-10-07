@@ -19,9 +19,9 @@ services:
       - key: CLIENT_URL
         value: https://study-assistant-mk34.onrender.com
       - key: GEMINI_MODEL
-        value: gemini-1.5-flash
+        value: gemini-2.5-flash
       - key: GEMINI_EMBEDDING_MODEL
-        value: text-embedding-004
+        value: gemini-embedding-001
       - key: MONGODB_URI
         sync: false # Set in Render Dashboard
       - key: GEMINI_API_KEY

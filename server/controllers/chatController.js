@@ -1,4 +1,6 @@
 import ChatMessage from '../models/ChatMessage.js';
+import Document from '../models/Document.js';
+import Chunk from '../models/Chunk.js';
 import { searchSimilarChunks } from '../services/vectorService.js';
 import { generateRAGChatAnswer } from '../services/geminiService.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -21,7 +23,26 @@ export const handleChat = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Question cannot be empty.' });
     }
 
-    // 1. Save user query message to database
+    // 1. Check if any documents exist in database
+    const totalDocsCount = await Document.countDocuments();
+    if (totalDocsCount === 0) {
+      const emptyNotice =
+        "⚠️ **No study materials uploaded yet!**\n\nPlease go to the **'Upload Notes / PDF'** tab, upload your course PDF or notes, and then you can ask any question about them.";
+      return res.json({
+        success: true,
+        sessionId,
+        message: {
+          sessionId,
+          role: 'assistant',
+          content: emptyNotice,
+          citations: [],
+        },
+        answer: emptyNotice,
+        citations: [],
+      });
+    }
+
+    // 2. Save user query message to database
     await ChatMessage.create({
       sessionId,
       role: 'user',
@@ -29,30 +50,29 @@ export const handleChat = async (req, res, next) => {
       scope: { type: scope, documentId, subject },
     });
 
-    // 2. Fetch recent conversation history for multi-turn context
+    // 3. Fetch recent conversation history for multi-turn context
     const history = await ChatMessage.find({ sessionId })
       .sort({ createdAt: 1 })
       .limit(8)
       .lean();
 
-    // 3. Search vector index for top relevant chunks
+    // 4. Search vector index for top relevant chunks (Hybrid search)
     const relevantChunks = await searchSimilarChunks({
-      query: question,
+      query: question.trim(),
       scope,
       documentId,
       subject,
       topK: 5,
-      minSimilarity: 0.15,
     });
 
-    // 4. Generate grounded answer via Gemini RAG
+    // 5. Generate grounded answer via Gemini RAG
     const { answer, citations } = await generateRAGChatAnswer({
       question: question.trim(),
       chunks: relevantChunks,
       history,
     });
 
-    // 5. Save assistant response
+    // 6. Save assistant response
     const assistantMessage = await ChatMessage.create({
       sessionId,
       role: 'assistant',

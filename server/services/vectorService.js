@@ -1,12 +1,28 @@
 import Chunk from '../models/Chunk.js';
+import Document from '../models/Document.js';
 import { cosineSimilarity } from '../utils/vectorMath.js';
 import { generateEmbedding } from './geminiService.js';
 
 /**
- * Searches for the top-k most relevant chunks using vector similarity.
- * Supports:
- * - MongoDB Atlas $vectorSearch (if Atlas search index is active)
- * - Automatic Cosine Similarity calculation with filtering (resilient fallback)
+ * Extract meaningful search keywords from query (excluding common stop words)
+ */
+const extractKeywords = (query) => {
+  if (!query) return [];
+  const stopWords = new Set([
+    'what', 'is', 'the', 'a', 'an', 'in', 'on', 'of', 'for', 'to', 'and', 'or', 'are', 'was',
+    'were', 'this', 'that', 'these', 'those', 'explain', 'describe', 'tell', 'me', 'about',
+    'how', 'why', 'can', 'you', 'give', 'from', 'my', 'uploaded', 'notes', 'document', 'pdf',
+    'please', 'show', 'list', 'define', 'kya', 'hai', 'batao', 'samjhao'
+  ]);
+  return query
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter((word) => word.length > 2 && !stopWords.has(word));
+};
+
+/**
+ * Searches for the top-k most relevant chunks using Hybrid Vector & Keyword similarity.
  *
  * @param {Object} options
  * @param {string} options.query - User question or query string
@@ -15,7 +31,7 @@ import { generateEmbedding } from './geminiService.js';
  * @param {string} [options.documentId] - Target document ID if scope === 'document'
  * @param {string} [options.subject] - Target subject if scope === 'subject'
  * @param {number} [options.topK=5] - Number of top chunks to retrieve
- * @param {number} [options.minSimilarity=0.25] - Minimum cosine similarity threshold
+ * @param {number} [options.minSimilarity=0.05] - Minimum threshold floor
  */
 export const searchSimilarChunks = async ({
   query,
@@ -24,74 +40,56 @@ export const searchSimilarChunks = async ({
   documentId = null,
   subject = null,
   topK = 5,
-  minSimilarity = 0.2,
+  minSimilarity = 0.05,
 }) => {
   try {
-    // 1. Generate query embedding if not provided
-    const embedding = queryEmbedding || (await generateEmbedding(query));
-
-    // 2. Build MongoDB query filter
+    // 1. Build MongoDB query filter
     const filter = {};
-    if (scope === 'document' && documentId) {
+    if (scope === 'document' && documentId && documentId !== 'all') {
       filter.documentId = documentId;
     } else if (scope === 'subject' && subject && subject !== 'All') {
       filter.subject = new RegExp(`^${subject}$`, 'i');
     }
 
-    let results = [];
-
-    // 3. Attempt Atlas $vectorSearch aggregation first
-    try {
-      const vectorSearchStage = {
-        $vectorSearch: {
-          index: 'vector_index',
-          path: 'embedding',
-          queryVector: embedding,
-          numCandidates: Math.max(50, topK * 10),
-          limit: topK,
-        },
-      };
-
-      if (Object.keys(filter).length > 0) {
-        vectorSearchStage.$vectorSearch.filter = filter;
-      }
-
-      const atlasResults = await Chunk.aggregate([
-        vectorSearchStage,
-        {
-          $project: {
-            _id: 1,
-            documentId: 1,
-            documentTitle: 1,
-            pageNumber: 1,
-            chunkIndex: 1,
-            text: 1,
-            subject: 1,
-            score: { $meta: 'vectorSearchScore' },
-          },
-        },
-      ]);
-
-      if (atlasResults && atlasResults.length > 0) {
-        return atlasResults;
-      }
-    } catch (atlasErr) {
-      // Atlas $vectorSearch index not configured or local environment - proceed to exact vector similarity
-      // (Silent fallback to ensure smooth user experience)
-    }
-
-    // 4. Exact Vector Similarity Search Fallback
-    const candidateChunks = await Chunk.find(filter)
+    // 2. Fetch candidate chunks
+    let candidateChunks = await Chunk.find(filter)
       .select('documentId documentTitle pageNumber chunkIndex text subject embedding')
       .lean();
+
+    // If no chunks found with specific subject/doc filter, fallback to all chunks
+    if ((!candidateChunks || candidateChunks.length === 0) && (filter.documentId || filter.subject)) {
+      candidateChunks = await Chunk.find()
+        .select('documentId documentTitle pageNumber chunkIndex text subject embedding')
+        .lean();
+    }
 
     if (!candidateChunks || candidateChunks.length === 0) {
       return [];
     }
 
-    // Compute cosine similarity for each chunk
+    // 3. Generate query embedding
+    const embedding = queryEmbedding || (await generateEmbedding(query));
+    const keywords = extractKeywords(query);
+
+    // 4. Score each chunk using Hybrid Search (Vector + Keyword matching)
     const scoredChunks = candidateChunks.map((chunk) => {
-      const sim = cosineSimilarity(embedding, chunk.embedding || []);
+      // Vector Cosine Similarity
+      const vSim = cosineSimilarity(embedding, chunk.embedding || []);
+
+      // Keyword match score
+      let keywordScore = 0;
+      if (keywords.length > 0 && chunk.text) {
+        const textLower = chunk.text.toLowerCase();
+        let matches = 0;
+        for (const kw of keywords) {
+          if (textLower.includes(kw)) matches++;
+        }
+        keywordScore = matches / keywords.length;
+      }
+
+      // Hybrid combined score (70% Vector + 30% Keyword boost)
+      const hybridScore = (vSim * 0.7) + (keywordScore * 0.3);
+
       return {
         _id: chunk._id,
         documentId: chunk.documentId,
@@ -100,15 +98,17 @@ export const searchSimilarChunks = async ({
         chunkIndex: chunk.chunkIndex,
         text: chunk.text,
         subject: chunk.subject,
-        score: sim,
+        score: Math.max(vSim, hybridScore),
+        vectorScore: vSim,
+        keywordScore,
       };
     });
 
-    // Sort descending by similarity score and take top-K
-    results = scoredChunks
-      .filter((c) => c.score >= minSimilarity)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    // Sort descending by score
+    scoredChunks.sort((a, b) => b.score - a.score);
+
+    // Return top-K chunks
+    const results = scoredChunks.slice(0, topK);
 
     return results;
   } catch (err) {

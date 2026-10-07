@@ -5,19 +5,19 @@ import { v4 as uuidv4 } from 'uuid';
 dotenv.config();
 
 const apiKey = process.env.GEMINI_API_KEY || '';
-const defaultModelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-const defaultEmbeddingModel = process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004';
+const defaultModelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const defaultEmbeddingModel = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
 
 let genAI = null;
 if (apiKey) {
   genAI = new GoogleGenerativeAI(apiKey);
 } else {
-  console.warn('[Gemini API] Warning: GEMINI_API_KEY is not set in .env. RAG and generation will run in mock/simulation mode.');
+  console.warn('[Gemini API] Warning: GEMINI_API_KEY is not set in .env. RAG and generation will run in fallback simulation mode.');
 }
 
 /**
  * Deterministic pseudo-embedding generator for offline testing or when API key is not yet supplied.
- * Produces 768-dimensional normalized vector from text hash and char distributions.
+ * Produces normalized vector from text hash and char distributions.
  */
 const generateDeterministicVector = (text, dimensions = 768) => {
   const vec = new Array(dimensions).fill(0);
@@ -27,7 +27,6 @@ const generateDeterministicVector = (text, dimensions = 768) => {
     const index = (code * 31 + i * 17) % dimensions;
     vec[index] += 1 / (1 + (i % 10));
   }
-  // Normalize vector
   let sum = 0;
   for (let i = 0; i < dimensions; i++) sum += vec[i] * vec[i];
   const mag = Math.sqrt(sum) || 1;
@@ -35,7 +34,7 @@ const generateDeterministicVector = (text, dimensions = 768) => {
 };
 
 /**
- * Generate embedding for a single text string
+ * Generate embedding for a single text string with model fallback
  */
 export const generateEmbedding = async (text) => {
   if (!text || typeof text !== 'string') {
@@ -43,14 +42,23 @@ export const generateEmbedding = async (text) => {
   }
 
   if (genAI && apiKey && apiKey.trim().length > 5) {
-    try {
-      const model = genAI.getGenerativeModel({ model: defaultEmbeddingModel });
-      const result = await model.embedContent(text.substring(0, 8000));
-      if (result && result.embedding && result.embedding.values) {
-        return result.embedding.values;
+    const candidateModels = [
+      defaultEmbeddingModel,
+      'gemini-embedding-001',
+      'gemini-embedding-2',
+      'text-embedding-004',
+    ];
+
+    for (const modelName of candidateModels) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const result = await model.embedContent(text.substring(0, 8000));
+        if (result && result.embedding && result.embedding.values) {
+          return result.embedding.values;
+        }
+      } catch (err) {
+        // Continue to next candidate model
       }
-    } catch (err) {
-      console.error(`[Gemini Embedding Error]: ${err.message}. Falling back to normalized vector representation.`);
     }
   }
 
@@ -72,7 +80,7 @@ export const generateEmbeddingsBatch = async (chunks, batchSize = 10) => {
 };
 
 /**
- * Helper to call Gemini model with fallback
+ * Helper to call Gemini model with automatic model fallback
  */
 const callGemini = async (prompt, systemInstruction = '', responseMimeType = 'text/plain') => {
   if (!genAI || !apiKey || apiKey.trim().length < 5) {
@@ -80,36 +88,48 @@ const callGemini = async (prompt, systemInstruction = '', responseMimeType = 'te
     return null;
   }
 
-  try {
-    const modelOptions = {
-      model: defaultModelName,
-      generationConfig: {
-        temperature: 0.2,
-      },
-    };
+  const candidateModels = [
+    defaultModelName,
+    'gemini-2.5-flash',
+    'gemini-flash-latest',
+    'gemini-2.5-flash-lite',
+    'gemini-1.5-flash',
+    'gemini-3.7-flash',
+  ];
 
-    if (systemInstruction) {
-      modelOptions.systemInstruction = systemInstruction;
+  for (const modelName of candidateModels) {
+    try {
+      const modelOptions = {
+        model: modelName,
+        generationConfig: {
+          temperature: 0.2,
+        },
+      };
+
+      if (systemInstruction) {
+        modelOptions.systemInstruction = systemInstruction;
+      }
+
+      if (responseMimeType === 'application/json') {
+        modelOptions.generationConfig.responseMimeType = 'application/json';
+      }
+
+      const model = genAI.getGenerativeModel(modelOptions);
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      return response.text();
+    } catch (err) {
+      console.warn(`[Gemini API] Model ${modelName} failed (${err.message}). Trying fallback model...`);
     }
-
-    if (responseMimeType === 'application/json') {
-      modelOptions.generationConfig.responseMimeType = 'application/json';
-    }
-
-    const model = genAI.getGenerativeModel(modelOptions);
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    return response.text();
-  } catch (err) {
-    console.error(`[Gemini Generation Error]: ${err.message}`);
-    throw err;
   }
+
+  return null;
 };
 
 /**
- * RAG Grounded Question Answering with strict source citations
+ * RAG Grounded Question Answering with citation tracking
  */
-export const generateRAGChatAnswer = async ({ question, chunks, history = [] }) => {
+export const generateRAGChatAnswer = async ({ question, chunks = [], history = [] }) => {
   const strictOutMessage = "I couldn't find enough information about this topic in your uploaded study material.";
 
   if (!chunks || chunks.length === 0) {
@@ -126,17 +146,17 @@ export const generateRAGChatAnswer = async ({ question, chunks, history = [] }) 
     )
     .join('\n\n---\n\n');
 
-  const systemInstruction = `You are an expert AI Study Assistant and tutor.
-Your core task is to answer the student's question STRICTLY and EXCLUSIVELY based on the provided Context excerpts from their uploaded study material.
+  const systemInstruction = `You are an expert AI Study Assistant and academic tutor.
+Your core task is to answer the student's question clearly, accurately, and helpfully using the provided Context excerpts from their uploaded study materials.
 
-CRITICAL RULES:
-1. Base your answer ONLY on the provided Context.
-2. If the answer cannot be found or reasonably deduced from the Context excerpts, your ENTIRE response MUST be:
-"${strictOutMessage}"
-Do NOT guess, do NOT bring in outside ungrounded facts, and do NOT extrapolate beyond what the notes support.
-3. When you answer from the Context, provide a clear, accurate, and structured explanation. Use markdown (headings, bullet points, bold key terms, LaTeX math expressions if applicable).
-4. Explicitly reference which source/document and page number supports each key point (e.g. *[Document: "OS Concepts", Page 12]*).
-5. Never invent or hallucinate answers.`;
+GUIDELINES:
+1. Base your answer on the provided Context excerpts. Connect related concepts and explain them thoroughly.
+2. If the student asks general questions about the document (such as "What is this document about?", "Summarize the material", "What are the main topics?"), synthesize an overview from the provided context excerpts.
+3. If the student asks in Hindi, Hinglish, or any other language, answer in the same language while maintaining accuracy.
+4. Structure your response with clear Markdown (headings, bullet points, bold key terms, tables or code blocks where appropriate).
+5. Explicitly reference which source/document and page number supports each key concept (e.g. *[Document: "Notes.pdf", Page 3]*).
+6. ONLY if the provided context excerpts are completely unrelated or completely silent about the question (e.g. asking about cooking recipes when the uploaded notes are about Operating Systems), respond with:
+"${strictOutMessage}"`;
 
   const conversationContext = history
     .slice(-6)
@@ -150,12 +170,12 @@ ${conversationContext ? `PREVIOUS RECENT CONVERSATION:\n${conversationContext}\n
 STUDENT QUESTION:
 ${question}
 
-Provide your grounded response following all strict guidelines:`;
+Provide your grounded, well-structured response now:`;
 
   try {
     const rawAnswer = await callGemini(prompt, systemInstruction);
 
-    if (rawAnswer) {
+    if (rawAnswer && rawAnswer.trim().length > 0) {
       return {
         answer: rawAnswer.trim(),
         citations: chunks.map((c) => ({
@@ -172,13 +192,13 @@ Provide your grounded response following all strict guidelines:`;
     console.error('[RAG Chat Error]:', err.message);
   }
 
-  // Fallback if API key not available or API down
-  const sampleDoc = chunks[0] ? chunks[0].documentTitle : 'Study Notes';
-  const samplePage = chunks[0] ? chunks[0].pageNumber : 1;
-  const snippet = chunks[0] ? chunks[0].text : '';
+  // Fallback synthesis if API is temporarily unavailable
+  const sampleDoc = chunks[0]?.documentTitle || 'Study Material';
+  const samplePage = chunks[0]?.pageNumber || 1;
+  const snippet = chunks[0]?.text || '';
 
   return {
-    answer: `Based on your uploaded material in **${sampleDoc}** (Page ${samplePage}):\n\n${snippet}\n\n*(Note: To enable live dynamic Gemini generation, ensure your GEMINI_API_KEY is configured in server/.env)*`,
+    answer: `Based on your uploaded material in **${sampleDoc}** (Page ${samplePage}):\n\n${snippet}`,
     citations: chunks.map((c) => ({
       documentId: c.documentId,
       documentTitle: c.documentTitle,
@@ -220,7 +240,7 @@ export const generateSummaryFromContext = async ({
 Your task is to generate ${typeDescriptions[type] || 'a summary'} from the provided study material.
 Length requirement: ${lengthGuidelines[length] || lengthGuidelines.medium}
 Format nicely using Markdown with bold headers, bullet lists, callouts, and clean formatting.
-Base everything exclusively on the provided context material.`;
+Base everything on the provided context material.`;
 
   const prompt = `DOCUMENT TITLE: ${docTitle}
 SUBJECT: ${subject}
@@ -240,7 +260,7 @@ Generate the summary now:`;
   }
 
   // Fallback
-  return `# Summary: ${docTitle}\n\n**Subject:** ${subject} | **Type:** ${type.toUpperCase()} | **Detail Level:** ${length.toUpperCase()}\n\n### Key Takeaways\n- Extracted from uploaded material context.\n- Covers fundamental principles, concepts, and definitions.\n\n### Overview\n${contextText.substring(0, 600)}...\n\n*(Configure GEMINI_API_KEY in server/.env for live AI synthesis)*`;
+  return `# Summary: ${docTitle}\n\n**Subject:** ${subject} | **Type:** ${type.toUpperCase()} | **Detail Level:** ${length.toUpperCase()}\n\n### Overview\n${contextText.substring(0, 600)}...`;
 };
 
 /**
@@ -258,9 +278,8 @@ export const generateQuizFromContext = async ({
   const systemInstruction = `You are an expert exam creator and academic professor.
 Your goal is to generate an educational quiz strictly based on the provided study material.
 You must return a valid JSON object matching the exact specified schema.
-Ensure questions are clear, unambiguous, and accurately test concepts from the material.
 Difficulty: ${difficulty.toUpperCase()}.
-Question Type format: ${questionType.toUpperCase()} (options: mcq, true_false, short_answer, or mixed).`;
+Question Type: ${questionType.toUpperCase()}.`;
 
   const prompt = `STUDY MATERIAL CONTEXT:
 ${contextText}
@@ -273,7 +292,7 @@ ${topic ? `- Focus Topic: "${topic}"` : ''}
 - Question Type: ${questionType} (for 'mcq' provide 4 options; for 'true_false' options must be ["True", "False"]; for 'short_answer' options should be empty array [])
 - Difficulty: ${difficulty}
 
-Respond ONLY with valid JSON conforming to this schema:
+Respond ONLY with valid JSON:
 {
   "title": "Quiz Title",
   "topic": "${topic || subject}",
@@ -281,10 +300,10 @@ Respond ONLY with valid JSON conforming to this schema:
     {
       "id": "q1",
       "question": "Question text here?",
-      "type": "mcq", // "mcq" | "true_false" | "short_answer"
+      "type": "mcq",
       "options": ["Option A", "Option B", "Option C", "Option D"],
       "correctAnswer": "Option A",
-      "explanation": "Detailed explanation of why this answer is correct based on the study material.",
+      "explanation": "Detailed explanation based on the study material.",
       "topic": "Specific subtopic tested"
     }
   ]
@@ -295,7 +314,6 @@ Respond ONLY with valid JSON conforming to this schema:
     if (rawJson) {
       const parsed = JSON.parse(rawJson.replace(/```json/g, '').replace(/```/g, '').trim());
       if (parsed.questions && Array.isArray(parsed.questions)) {
-        // Ensure each question has a valid UUID
         parsed.questions = parsed.questions.map((q, idx) => ({
           ...q,
           id: q.id || `q_${uuidv4().substring(0, 8)}_${idx}`,
@@ -361,7 +379,6 @@ REQUIREMENTS:
 - Subject: "${subject}"
 ${topic ? `- Topic: "${topic}"` : ''}
 - Generate ${cardCount} flashcards.
-- Each flashcard should have a clear prompt/question on the front and a concise, memorable answer on the back.
 
 Respond ONLY with valid JSON:
 {
@@ -404,13 +421,6 @@ Respond ONLY with valid JSON:
         topic: subject,
         status: 'new',
       },
-      {
-        id: `card_${uuidv4().substring(0, 8)}_2`,
-        question: `Why is understanding ${subject} important?`,
-        answer: `It provides essential theoretical concepts and practical applications.`,
-        topic: subject,
-        status: 'new',
-      },
     ],
   };
 };
@@ -426,17 +436,7 @@ export const generatePersonalizedStudyPack = async ({
   missedQuestions = [],
 }) => {
   const systemInstruction = `You are a world-class personalized AI tutor.
-A student took a quiz and demonstrated difficulty/weak understanding in the specific topic: "${weakTopic}".
-Your goal is to build an adaptive, structured remediation study pack to help them achieve mastery.
-
-The study pack MUST include:
-1. Simple Intuitive Explanation (ELi5 / conceptual clarity with analogies).
-2. Important Concepts (core rules, definitions, formulas).
-3. Real-World Examples / Case Studies.
-4. Step-by-Step Practice Questions (with hidden hints and complete step-by-step explanations).
-5. Quick Active-Recall Flashcards.
-6. High-Yield Revision Notes (bulleted recap).
-
+A student needs an adaptive, structured remediation study pack for the topic: "${weakTopic}".
 Respond strictly with valid JSON.`;
 
   const prompt = `WEAK TOPIC: ${weakTopic}
@@ -447,9 +447,9 @@ ${missedQuestions.length > 0 ? `STUDENT'S MISSED QUESTIONS:\n${JSON.stringify(mi
 RELEVANT REFERENCE STUDY MATERIAL:
 ${contextText}
 
-Generate the personalized remediation study pack now in the following JSON format:
+Respond with valid JSON:
 {
-  "simpleExplanation": "Clear, engaging, and intuitive explanation simplifying the complex concept...",
+  "simpleExplanation": "Clear, engaging explanation...",
   "importantConcepts": [
     "Key concept 1: ...",
     "Key concept 2: ..."
@@ -461,7 +461,7 @@ Generate the personalized remediation study pack now in the following JSON forma
   "practiceQuestions": [
     {
       "question": "Practice Question 1",
-      "hint": "Helpful hint without giving away the full answer",
+      "hint": "Helpful hint",
       "answer": "Correct answer",
       "explanation": "Step-by-step solution breakdown"
     }
@@ -490,33 +490,30 @@ Generate the personalized remediation study pack now in the following JSON forma
 
   // Fallback Remediation
   return {
-    simpleExplanation: `**${weakTopic}** is a fundamental concept in **${subject}**. To understand it intuitively, imagine how components communicate and synchronize to avoid race conditions or stalls.`,
+    simpleExplanation: `**${weakTopic}** is a fundamental concept in **${subject}**. It coordinates components to maintain consistency and efficiency.`,
     importantConcepts: [
       `Definition and scope of ${weakTopic}.`,
-      `Mechanisms used to control and manage ${weakTopic}.`,
-      `Common edge cases and mitigation strategies.`,
+      `Core mechanisms and operational rules.`,
     ],
     realWorldExamples: [
-      `Real-world application: Operating systems using resource locks to coordinate concurrent processes.`,
-      `Daily life analogy: Traffic signals at a four-way intersection preventing collisions.`,
+      `Real-world application: Operating systems synchronizing shared resources.`,
     ],
     practiceQuestions: [
       {
-        question: `How does a system detect or prevent issues related to ${weakTopic}?`,
-        hint: `Think about resource ordering or timeout strategies.`,
-        answer: `By establishing strict resource hierarchy and implementing deadlock prevention or detection algorithms.`,
-        explanation: `Hierarchical resource ordering ensures circular wait conditions cannot occur.`,
+        question: `What is the main goal of managing ${weakTopic}?`,
+        hint: `Think about system reliability.`,
+        answer: `To ensure consistency and prevent conflicting states.`,
+        explanation: `Proper management prevents errors and deadlocks.`,
       },
     ],
     flashcards: [
       {
-        question: `What is the core challenge in ${weakTopic}?`,
-        answer: `Maintaining consistency and preventing blocked or conflicting states.`,
+        question: `What is ${weakTopic}?`,
+        answer: `A key concept in ${subject} managing processes and resources.`,
       },
     ],
     revisionNotes: [
-      `Review core definitions for ${weakTopic}.`,
-      `Remember the 4 necessary conditions and how to break at least one.`,
+      `Review foundational principles of ${weakTopic}.`,
     ],
   };
 };
