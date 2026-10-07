@@ -22,17 +22,44 @@ const PORT = process.env.PORT || 5001;
 // Connect to Database
 connectDB();
 
-// Middlewares
+// CORS configuration for Render deployment
+const allowedOrigins = [
+  'https://study-assistant-mk34.onrender.com',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: '*',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, server-to-server) or in allowed list
+      if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
+        callback(null, true);
+      } else {
+        callback(null, true); // Permissive for easy API testing and cross-origin access
+      }
+    },
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
+
 app.use(morgan('dev'));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Root welcome route
+app.get('/', (req, res) => {
+  res.json({
+    name: 'AI Study Assistant Backend API',
+    status: 'online',
+    version: '1.0.0',
+    documentation: '/api/health',
+    deployedFrontend: 'https://study-assistant-mk34.onrender.com',
+  });
+});
 
 // Health Check API
 app.get('/api/health', (req, res) => {
@@ -41,6 +68,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     service: 'AI Study Assistant RAG API',
     model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
+    embeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004',
   });
 });
 
@@ -56,11 +84,12 @@ app.use('/api/analytics', analyticsRoutes);
 // Error Handling Middleware
 app.use(errorHandler);
 
-// Start server
-app.listen(PORT, () => {
+// Start server on 0.0.0.0 for Render host binding
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(` 🚀 AI Study Assistant Backend running on port ${PORT}`);
-  console.log(` 📚 Endpoints available at http://localhost:${PORT}/api/`);
+  console.log(` 📚 Health Check: http://localhost:${PORT}/api/health`);
+  console.log(` 🌐 Render Client URL: https://study-assistant-mk34.onrender.com`);
   console.log(`====================================================`);
 });
 
